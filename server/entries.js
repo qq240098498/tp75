@@ -6,6 +6,9 @@ const MODULE_PATTERN = /^[a-z][a-z0-9-]{0,29}$/;
 const KEY_PATTERN = /^[a-z][a-z0-9_-]*(\.[a-z0-9_-]+)+$/;
 const MAX_KEY_LENGTH = 120;
 
+const DEFAULT_SIMILAR_LIMIT = 5;
+const MAX_SIMILAR_LIMIT = 20;
+
 function validateModule(value) {
   const module = pickText(value);
   if (!module) throw new ApiError(400, 'MODULE_REQUIRED', '请填写模块名', 'module');
@@ -98,6 +101,51 @@ function sortEntries(list) {
   });
 }
 
+// 相似度只比较正文：去掉所有空白后做大小写折叠，首尾空格与全半角差异都不影响结果
+function normalizeForCompare(value) {
+  return String(value == null ? '' : value).replace(/\s+/g, '').toLowerCase();
+}
+
+// 莱文斯坦编辑距离：把一个串改成另一个串所需的最少增删改次数，按码元逐个比较
+function editDistance(a, b) {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  let prev = Array.from({ length: b.length + 1 }, (_unused, index) => index);
+  let next = new Array(b.length + 1);
+  for (let i = 1; i <= a.length; i += 1) {
+    next[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      next[j] = Math.min(prev[j] + 1, next[j - 1] + 1, prev[j - 1] + cost);
+    }
+    [prev, next] = [next, prev];
+  }
+  return prev[b.length];
+}
+
+// 归一化到 0~1：完全一致为 1，毫无关系时趋近 0，结果保留四位小数便于页面上稳定展示
+function similarityScore(text, candidate) {
+  if (text === candidate) return 1;
+  const longest = Math.max(text.length, candidate.length);
+  if (longest === 0) return 1;
+  return Number((1 - editDistance(text, candidate) / longest).toFixed(4));
+}
+
+// 候选条数：缺省给默认值，必须是正整数且不超过上限，取不满时由调用方按实际条数返回
+function readSimilarLimit(value) {
+  const text = pickText(value);
+  if (!text) return DEFAULT_SIMILAR_LIMIT;
+  if (!/^\d+$/.test(text)) {
+    throw new ApiError(400, 'LIMIT_INVALID', '候选条数需要是正整数', 'limit');
+  }
+  const limit = Number(text);
+  if (limit < 1 || limit > MAX_SIMILAR_LIMIT) {
+    throw new ApiError(400, 'LIMIT_INVALID', `候选条数要在 1 到 ${MAX_SIMILAR_LIMIT} 之间`, 'limit');
+  }
+  return limit;
+}
+
 // 按模块与关键词筛选：关键词同时匹配文案键与任意一种语言的译文
 function listEntries(options) {
   const input = options && typeof options === 'object' ? options : {};
@@ -128,6 +176,78 @@ function getEntry(id) {
   const found = data.entries.find((item) => item.id === id);
   if (!found) throw new ApiError(404, 'ENTRY_NOT_FOUND', '这条文案不存在或已被删除', '');
   return found;
+}
+
+// 在已经填过的译文里找与当前文本最接近的几条，供编辑表单旁边的参考区使用。
+// 排序是确定的：原文完全一致的排最前，随后按接近程度降序；程度相同时按文案键、
+// 语言代码、文案 id 依次稳定排序，因此同样的查询重复发起顺序不会变化。
+function findSimilarTranslations(options) {
+  const input = options && typeof options === 'object' ? options : {};
+  const data = load();
+  const limit = readSimilarLimit(input.limit);
+  const module = pickText(input.module);
+  const selfEntryId = pickText(input.entryId);
+  const selfLanguage = pickText(input.selfLanguage);
+  const query = normalizeForCompare(input.text);
+
+  // 语言范围：逗号分隔的多个代码，大小写不敏感，全部映射成登记过的真实写法；
+  // 一个都没对上就当作范围里没有候选，而不是悄悄放宽到所有语言
+  const languageCodes = [];
+  const languageParam = pickText(input.languages);
+  if (languageParam) {
+    const known = new Map();
+    data.languages.forEach((item) => known.set(item.code.toLowerCase(), item.code));
+    const wanted = new Set();
+    languageParam.split(',').map((code) => code.trim().toLowerCase()).filter(Boolean).forEach((code) => wanted.add(code));
+    wanted.forEach((code) => {
+      const actual = known.get(code);
+      if (actual) languageCodes.push(actual);
+    });
+  }
+  // 显式给了语言范围、却一个代码都没对上时，保留空集合把候选全部过滤掉，而不是悄悄放宽成所有语言
+  const languageSet = languageParam ? new Set(languageCodes) : null;
+
+  const candidates = [];
+  data.entries.forEach((entry) => {
+    if (module && entry.module !== module) return;
+    Object.keys(entry.translations).forEach((code) => {
+      // 编辑已有文案时，正在改的这一格不算候选；同一条文案的其它语言译文照样可以拿来参考
+      if (selfEntryId && entry.id === selfEntryId && (!selfLanguage || code === selfLanguage)) return;
+      if (languageSet && !languageSet.has(code)) return;
+      const value = entry.translations[code];
+      if (typeof value !== 'string' || !value.trim()) return;
+      const candidate = normalizeForCompare(value);
+      const score = similarityScore(query, candidate);
+      candidates.push({
+        entryId: entry.id,
+        module: entry.module,
+        key: entry.key,
+        language: code,
+        text: value,
+        score,
+        exact: query === candidate,
+      });
+    });
+  });
+
+  candidates.sort((a, b) => {
+    if (a.exact !== b.exact) return a.exact ? -1 : 1;
+    if (a.score !== b.score) return a.score > b.score ? -1 : 1;
+    if (a.key !== b.key) return a.key < b.key ? -1 : 1;
+    if (a.language !== b.language) return a.language < b.language ? -1 : 1;
+    return a.entryId < b.entryId ? -1 : 1;
+  });
+
+  const items = candidates.slice(0, limit).map((item) => ({
+    entryId: item.entryId,
+    module: item.module,
+    key: item.key,
+    language: item.language,
+    text: item.text,
+    score: item.score,
+    exact: item.exact,
+  }));
+  return { text: typeof input.text === 'string' ? input.text : '', module: module || '', languages: languageCodes, limit, total: candidates.length, items };
 }
 
 function createEntry(payload) {
@@ -193,6 +313,7 @@ function deleteEntry(id) {
 module.exports = {
   listEntries,
   getEntry,
+  findSimilarTranslations,
   createEntry,
   updateEntry,
   deleteEntry,

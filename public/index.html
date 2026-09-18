@@ -77,19 +77,45 @@
       </div>
       <p class="empty-tip hidden" id="entry-empty">当前筛选条件下没有文案</p>
 
-      <form class="entry-form hidden" id="entry-form" autocomplete="off">
-        <h3 id="entry-form-title">新建文案</h3>
-        <div class="form-row">
-          <label data-field="module">模块<input id="entry-module" placeholder="例如 home" maxlength="30"></label>
-          <label data-field="key">文案键<input id="entry-key" placeholder="例如 home.banner.title" maxlength="120"></label>
-        </div>
-        <div class="form-row translations" id="entry-translations"></div>
-        <label class="full" data-field="note">备注<input id="entry-note" placeholder="这条文案出现的页面位置" maxlength="200"></label>
-        <div class="form-actions">
-          <button type="submit">保存</button>
-          <button type="button" id="entry-cancel" class="ghost">取消</button>
-        </div>
-      </form>
+      <div class="entry-editor hidden" id="entry-editor">
+        <form class="entry-form" id="entry-form" autocomplete="off">
+          <h3 id="entry-form-title">新建文案</h3>
+          <div class="form-row">
+            <label data-field="module">模块<input id="entry-module" placeholder="例如 home" maxlength="30"></label>
+            <label data-field="key">文案键<input id="entry-key" placeholder="例如 home.banner.title" maxlength="120"></label>
+          </div>
+          <div class="form-row translations" id="entry-translations"></div>
+          <label class="full" data-field="note">备注<input id="entry-note" placeholder="这条文案出现的页面位置" maxlength="200"></label>
+          <div class="form-actions">
+            <button type="submit">保存</button>
+            <button type="button" id="entry-cancel" class="ghost">取消</button>
+          </div>
+        </form>
+
+        <aside class="reference-panel" id="reference-panel">
+          <div class="reference-head">
+            <h3>参考译文</h3>
+            <span class="panel-tip">按已填译文找与当前输入最接近的几条</span>
+          </div>
+          <div class="reference-controls">
+            <label class="check"><input type="checkbox" id="ref-same-module" checked> 只在本模块里找</label>
+            <div class="ref-languages">
+              <span class="ref-control-label">语言范围</span>
+              <label class="check"><input type="checkbox" id="ref-all-languages" checked> 全部</label>
+              <span id="ref-language-list" class="ref-language-list"></span>
+            </div>
+            <label class="ref-limit">条数上限
+              <input id="ref-limit" type="number" min="1" max="20" value="5">
+            </label>
+          </div>
+          <div class="reference-current">
+            正在参考：<strong id="ref-current-label">—</strong>
+          </div>
+          <div class="reference-list" id="reference-list">
+            <p class="reference-tip">点任意一种语言的译文输入框，这里会列出最接近的已填译文</p>
+          </div>
+        </aside>
+      </div>
     </section>
   </main>
 

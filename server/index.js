@@ -58,6 +58,23 @@ app.post('/api/entries', (req, res) => {
   }
 });
 
+// 参考译文：按当前正在编辑的文本找最接近的几条已填译文，可用模块、语言范围与条数上限收窄
+app.get('/api/entries/similar', (req, res) => {
+  try {
+    const result = api.findSimilarTranslations({
+      text: api.readQuery(req.query, 'text'),
+      module: api.readQuery(req.query, 'module'),
+      languages: api.readQuery(req.query, 'languages'),
+      entryId: api.readQuery(req.query, 'entryId'),
+      selfLanguage: api.readQuery(req.query, 'selfLanguage'),
+      limit: api.readQuery(req.query, 'limit'),
+    });
+    res.json(result);
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
 app.get('/api/entries/:id', (req, res) => {
   try {
     res.json(api.getEntry(req.params.id));
