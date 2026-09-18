@@ -7,6 +7,16 @@ const state = {
   editingId: '',
 };
 
+// 参考译文区的运行时状态：activeCode 是当前正在编辑的语言，languages 为空表示不按语言收窄，
+// seq 用来丢弃过期的查询结果，timer 负责输入时的防抖
+const reference = {
+  activeCode: '',
+  languages: new Set(),
+  seq: 0,
+  timer: 0,
+};
+const REFERENCE_DEBOUNCE_MS = 250;
+
 const el = (id) => document.getElementById(id);
 
 // 统一的请求入口：出错时把服务端给的错误码、说明与出错位置一起抛出去
@@ -101,6 +111,7 @@ async function loadLanguages() {
   state.languages = payload.languages || [];
   renderLanguages();
   renderTranslationInputs();
+  if (!el('entry-editor').classList.contains('hidden')) renderReferenceChips();
 }
 
 async function loadEntries() {
@@ -212,14 +223,149 @@ function openEntryForm(entry) {
   el('entry-note').value = entry ? entry.note : '';
   el('entry-translations').innerHTML = '';
   renderTranslationInputs(entry ? entry.translations : {});
-  el('entry-form').classList.remove('hidden');
+  resetReferencePanel();
+  el('entry-editor').classList.remove('hidden');
   el('entry-module').focus();
 }
 
 function closeEntryForm() {
   state.editingId = '';
-  el('entry-form').classList.add('hidden');
+  el('entry-editor').classList.add('hidden');
   clearFieldMarks();
+}
+
+// 参考译文区：语言筛选用一组可点选的代码小签，一个都没选表示不按语言收窄；
+// 在“全部”状态下取消某一种时，先把其余语言都选上再移除它，语义上仍然直观
+function renderReferenceChips() {
+  const box = el('ref-lang-chips');
+  // 语言被删除后，收窄集合里可能还留着旧代码，先剔掉，再判断是否处于收窄状态
+  const known = new Set(state.languages.map((item) => item.code));
+  Array.from(reference.languages).forEach((code) => {
+    if (!known.has(code)) reference.languages.delete(code);
+  });
+  const narrowing = reference.languages.size > 0;
+  box.innerHTML = state.languages.map((item) => {
+    const on = !narrowing || reference.languages.has(item.code);
+    return `<label class="ref-lang-chip${on ? ' on' : ''}" title="只看这种语言的译文；一个都不勾表示全部语言">
+      <input type="checkbox" data-ref-lang="${escapeHtml(item.code)}"${on ? ' checked' : ''}>
+      ${escapeHtml(item.code)}
+    </label>`;
+  }).join('');
+}
+
+function resetReferencePanel() {
+  reference.activeCode = '';
+  reference.seq += 1;
+  window.clearTimeout(reference.timer);
+  renderReferenceChips();
+  el('reference-current').innerHTML = '点任意一种语言的译文输入框，这里会按那格的内容找参考';
+  el('reference-list').innerHTML = '';
+  el('reference-empty').classList.add('hidden');
+  el('reference-empty').textContent = '';
+}
+
+function activeTranslationInput() {
+  if (!reference.activeCode) return null;
+  return Array.from(document.querySelectorAll('.translation-input'))
+    .find((input) => input.dataset.code === reference.activeCode) || null;
+}
+
+function scoreLabel(item) {
+  if (item.exact) return { text: '完全一致', cls: 'exact' };
+  const percent = Math.round(item.score * 100);
+  return { text: `接近 ${percent}%`, cls: percent >= 75 ? 'high' : '' };
+}
+
+function renderReferences(items, currentCode) {
+  const list = el('reference-list');
+  const empty = el('reference-empty');
+  list.innerHTML = items.map((item) => {
+    const badge = scoreLabel(item);
+    return `<li class="reference-item${item.exact ? ' exact' : ''}">
+      <div class="reference-item-head">
+        <span class="reference-item-key">${escapeHtml(item.key)}</span>
+        <span class="score-badge ${badge.cls}">${badge.text}</span>
+      </div>
+      <div class="reference-item-meta">
+        <span class="tag off">${escapeHtml(item.module)}</span>
+        <span class="tag on">${escapeHtml(item.language)}</span>
+        ${item.entryId === state.editingId ? '<span class="tag off">本条文案</span>' : ''}
+      </div>
+      <div class="reference-item-text">${escapeHtml(item.text)}</div>
+    </li>`;
+  }).join('');
+  empty.classList.toggle('hidden', items.length > 0);
+  if (items.length === 0) {
+    empty.textContent = currentCode
+      ? `没有找到与 ${currentCode} 当前内容接近的已填译文，换个范围或放宽上限试试`
+      : '';
+  }
+}
+
+// 按当前焦点输入框的内容发起查询；同一个时刻只认最后一次请求，返回慢的旧结果直接丢弃
+async function fetchReferences() {
+  const code = reference.activeCode;
+  const input = activeTranslationInput();
+  if (!code || !input) return;
+  const text = input.value.trim();
+
+  const current = el('reference-current');
+  current.innerHTML = `<b>${escapeHtml(code)}</b>：${text ? escapeHtml(text) : '（当前为空，输入内容后开始匹配）'}`;
+  el('reference-list').innerHTML = '';
+  el('reference-empty').classList.add('hidden');
+  if (!text) {
+    // 清空后让还没返回的旧查询作废，避免旧结果晚到又填回来
+    reference.seq += 1;
+    return;
+  }
+
+  const params = new URLSearchParams();
+  params.set('text', text);
+  params.set('limit', el('ref-limit').value);
+  if (state.editingId) {
+    params.set('excludeEntry', state.editingId);
+    params.set('excludeLanguage', code);
+  }
+  if (el('ref-same-module').checked && el('entry-module').value.trim()) {
+    params.set('module', el('entry-module').value.trim());
+  }
+  reference.languages.forEach((lang) => params.append('languages', lang));
+
+  const seq = (reference.seq += 1);
+  let payload;
+  try {
+    payload = await request(`/api/entries/similar?${params.toString()}`);
+  } catch (err) {
+    if (seq === reference.seq) {
+      el('reference-empty').textContent = `参考译文加载失败：${err.message}`;
+      el('reference-empty').classList.remove('hidden');
+    }
+    return;
+  }
+  if (seq !== reference.seq) return;
+  renderReferences(payload.references || [], code);
+}
+
+function scheduleReferenceFetch() {
+  window.clearTimeout(reference.timer);
+  reference.timer = window.setTimeout(fetchReferences, REFERENCE_DEBOUNCE_MS);
+}
+
+function toggleReferenceLanguage(code, checked) {
+  if (checked) {
+    reference.languages.add(code);
+    // 又把全部语言都选回来时，恢复成“不限语言”，这样之后新增的语言也自动纳入
+    const all = state.languages.length > 0
+      && state.languages.every((item) => reference.languages.has(item.code));
+    if (all) reference.languages.clear();
+  } else if (reference.languages.size === 0) {
+    state.languages.forEach((item) => reference.languages.add(item.code));
+    reference.languages.delete(code);
+  } else {
+    reference.languages.delete(code);
+  }
+  renderReferenceChips();
+  fetchReferences();
 }
 
 async function submitLanguage(event) {
@@ -336,6 +482,30 @@ document.addEventListener('click', async (event) => {
 
 el('language-form').addEventListener('submit', submitLanguage);
 el('entry-form').addEventListener('submit', submitEntry);
+
+// 参考区的事件：焦点落到哪种语言的输入框，就按哪种语言找参考；输入过程中防抖刷新
+el('entry-translations').addEventListener('focusin', (event) => {
+  const input = event.target.closest('.translation-input');
+  if (!input) return;
+  if (reference.activeCode !== input.dataset.code) reference.activeCode = input.dataset.code;
+  fetchReferences();
+});
+el('entry-translations').addEventListener('input', (event) => {
+  if (!event.target.classList.contains('translation-input')) return;
+  reference.activeCode = event.target.dataset.code;
+  scheduleReferenceFetch();
+});
+el('entry-module').addEventListener('input', () => {
+  if (el('ref-same-module').checked) scheduleReferenceFetch();
+});
+el('ref-same-module').addEventListener('change', fetchReferences);
+el('ref-limit').addEventListener('change', fetchReferences);
+el('ref-lang-chips').addEventListener('change', (event) => {
+  const checkbox = event.target.closest('[data-ref-lang]');
+  if (!checkbox) return;
+  toggleReferenceLanguage(checkbox.dataset.refLang, checkbox.checked);
+});
+
 el('entry-new').addEventListener('click', () => {
   clearNotice();
   openEntryForm(null);

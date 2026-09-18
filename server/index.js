@@ -50,6 +50,19 @@ app.get('/api/entries', (req, res) => {
   res.json(result);
 });
 
+// 参考译文：编辑某条文案的某种语言时，按当前文本找出几条最接近的已填译文
+app.get('/api/entries/similar', (req, res) => {
+  const result = api.findReferences({
+    text: api.readQuery(req.query, 'text'),
+    module: api.readQuery(req.query, 'module'),
+    languages: req.query.languages,
+    limit: api.readQuery(req.query, 'limit'),
+    excludeEntry: api.readQuery(req.query, 'excludeEntry'),
+    excludeLanguage: api.readQuery(req.query, 'excludeLanguage'),
+  });
+  res.json(result);
+});
+
 app.post('/api/entries', (req, res) => {
   try {
     res.status(201).json(api.createEntry(req.body));

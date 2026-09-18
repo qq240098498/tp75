@@ -6,6 +6,10 @@ const MODULE_PATTERN = /^[a-z][a-z0-9-]{0,29}$/;
 const KEY_PATTERN = /^[a-z][a-z0-9_-]*(\.[a-z0-9_-]+)+$/;
 const MAX_KEY_LENGTH = 120;
 
+// 参考译文：默认取 5 条，页面上可以另行指定，最高一次取 50 条
+const DEFAULT_REFERENCE_LIMIT = 5;
+const MAX_REFERENCE_LIMIT = 50;
+
 function validateModule(value) {
   const module = pickText(value);
   if (!module) throw new ApiError(400, 'MODULE_REQUIRED', '请填写模块名', 'module');
@@ -123,6 +127,118 @@ function listEntries(options) {
   return { entries: sortEntries(list), modules };
 }
 
+// 莱文斯坦距离：把一个串改成另一个串最少需要多少次增、删、改
+function levenshtein(a, b) {
+  const prev = new Array(b.length + 1);
+  const curr = new Array(b.length + 1);
+  for (let j = 0; j <= b.length; j += 1) prev[j] = j;
+  for (let i = 1; i <= a.length; i += 1) {
+    curr[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+    }
+    for (let j = 0; j <= b.length; j += 1) prev[j] = curr[j];
+  }
+  return prev[b.length];
+}
+
+// 接近程度取 0 到 1 之间的数：完全一致为 1，距离越远越小，两边都是空串也算一致
+function similarity(a, b) {
+  if (a === b) return 1;
+  const longest = Math.max(a.length, b.length);
+  if (longest === 0) return 1;
+  return 1 - levenshtein(a, b) / longest;
+}
+
+// 参考区只认已经填过的译文：空串表示还没翻译，不算候选
+function isFilled(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+// 候选条数：页面可以指定，没给或给得不合法时按默认值；只夹到允许的范围内，不报错
+function resolveLimit(value) {
+  const text = pickText(value);
+  if (!text) return DEFAULT_REFERENCE_LIMIT;
+  const parsed = Number(text);
+  if (!Number.isInteger(parsed) || parsed <= 0) return DEFAULT_REFERENCE_LIMIT;
+  return Math.min(parsed, MAX_REFERENCE_LIMIT);
+}
+
+// 语言收窄支持一次给多个代码（重复参数或逗号分隔），大小写不敏感，去重后保持出现顺序；
+// 给了但没有一个登记过，就当作没有候选，而不是退回到全部语言
+function resolveLanguageCodes(raw, known) {
+  if (!raw) return null;
+  const values = Array.isArray(raw) ? raw : [raw];
+  const codes = [];
+  const seen = new Set();
+  values.forEach((value) => {
+    String(value).split(',').forEach((piece) => {
+      const code = known.get(piece.trim().toLowerCase());
+      if (code && !seen.has(code)) {
+        seen.add(code);
+        codes.push(code);
+      }
+    });
+  });
+  return codes;
+}
+
+// 找出跟当前文本最接近的几条已填译文：完全一致排最前，其余按接近程度由高到低；
+// 接近程度相同时按文案键、再按语言、最后按文案 id 排序，数据顺序不变时重复查询结果稳定
+function findReferences(options) {
+  const input = options && typeof options === 'object' ? options : {};
+  const text = pickText(input.text);
+  const data = load();
+
+  const known = new Map();
+  data.languages.forEach((item) => known.set(item.code.toLowerCase(), item.code));
+  const module = pickText(input.module);
+  const wantedCodes = resolveLanguageCodes(input.languages, known);
+  const limit = resolveLimit(input.limit);
+  const excludeEntry = pickText(input.excludeEntry);
+  const excludeLanguage = pickText(input.excludeLanguage);
+
+  // 当前文本为空时没有可比对象，直接给空结果，取不满上限也不算错误
+  if (!text || (wantedCodes && wantedCodes.length === 0)) {
+    return { text, references: [] };
+  }
+
+  const wanted = wantedCodes ? new Set(wantedCodes) : null;
+  const references = [];
+  data.entries.forEach((entry) => {
+    if (module && entry.module !== module) return;
+    Object.keys(entry.translations).forEach((code) => {
+      if (wanted && !wanted.has(code)) return;
+      // 只跳过正在编辑的这一格（同一条文案 + 同一种语言），这条文案的其它语言仍然可以参考
+      if (excludeEntry && excludeLanguage
+        && entry.id === excludeEntry && code.toLowerCase() === excludeLanguage.toLowerCase()) return;
+      const value = entry.translations[code];
+      if (!isFilled(value)) return;
+      const score = similarity(text, value);
+      references.push({
+        entryId: entry.id,
+        module: entry.module,
+        key: entry.key,
+        language: code,
+        text: value,
+        score: Number(score.toFixed(4)),
+        exact: score === 1,
+      });
+    });
+  });
+
+  references.sort((a, b) => {
+    if (a.exact !== b.exact) return a.exact ? -1 : 1;
+    if (a.score !== b.score) return b.score - a.score;
+    if (a.key !== b.key) return a.key < b.key ? -1 : 1;
+    if (a.language !== b.language) return a.language < b.language ? -1 : 1;
+    return a.entryId < b.entryId ? -1 : (a.entryId > b.entryId ? 1 : 0);
+  });
+
+  return { text, references: references.slice(0, limit) };
+}
+
 function getEntry(id) {
   const data = load();
   const found = data.entries.find((item) => item.id === id);
@@ -196,6 +312,7 @@ module.exports = {
   createEntry,
   updateEntry,
   deleteEntry,
+  findReferences,
   validateModule,
   validateKey,
   validateTranslations,
